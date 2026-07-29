@@ -190,6 +190,26 @@ pub fn normalize(vec: anytype) @TypeOf(vec) {
     );
 }
 
+/// Like `normalize`, but returns `fallback` when the vector is too short to have a
+/// meaningful direction. `normalize` divides by the norm unconditionally, so a zero
+/// vector yields NaN; this is the guarded form for inputs that may be degenerate.
+///
+/// The threshold is on the *squared* norm, so no square root is taken on the reject path.
+/// Container kind is preserved: a `@Vector` in yields a `@Vector`, an array yields an array.
+pub fn normalize_safe(
+    vec: anytype,
+    fallback: @TypeOf(vec),
+    min_norm_sqr: Float(@bitSizeOf(meta.Child(@TypeOf(vec)))),
+) @TypeOf(vec) {
+    if (norm_sqr(vec) <= min_norm_sqr) return fallback;
+    return normalize(vec);
+}
+
+/// `normalize_safe` with a default threshold of 1.0e-6 on the squared norm.
+pub fn normalize_safe_default(vec: anytype, fallback: @TypeOf(vec)) @TypeOf(vec) {
+    return normalize_safe(vec, fallback, 1.0e-6);
+}
+
 /// dot product of two vectors.
 pub fn dot(vec: anytype, other: @TypeOf(vec)) meta.Child(@TypeOf(vec)) {
     if (@typeInfo(@TypeOf(vec)) == .array)
@@ -523,6 +543,31 @@ test normalize {
     const v_i32 = @Vector(2, i32){ 3, 4 };
     const normalized_i32 = normalize(v_i32);
     try std.testing.expectEqual(@Vector(2, i32){ 0, 0 }, normalized_i32); // Integer division limitations
+}
+
+test normalize_safe {
+    const fallback = @Vector(3, f32){ 1, 0, 0 };
+
+    // Degenerate input takes the fallback instead of dividing through to NaN.
+    try std.testing.expectEqual(fallback, normalize_safe_default(@Vector(3, f32){ 0, 0, 0 }, fallback));
+    try std.testing.expect(std.math.isNan(normalize(@Vector(3, f32){ 0, 0, 0 })[0]));
+
+    // Non-degenerate input agrees with `normalize`.
+    const v = @Vector(3, f32){ 3, 4, 0 };
+    try std.testing.expectEqual(normalize(v), normalize_safe_default(v, fallback));
+
+    // The threshold is on the squared norm, so a vector shorter than it is rejected.
+    const tiny = @Vector(3, f32){ 1.0e-4, 0, 0 }; // norm_sqr == 1.0e-8
+    try std.testing.expectEqual(fallback, normalize_safe_default(tiny, fallback));
+    try std.testing.expectEqual(normalize(tiny), normalize_safe(tiny, fallback, 1.0e-12));
+
+    // Container kind is preserved: an array in yields an array out.
+    const array_fallback = [3]f32{ 1, 0, 0 };
+    try std.testing.expectEqual(array_fallback, normalize_safe_default([3]f32{ 0, 0, 0 }, array_fallback));
+    const normalized_array = normalize_safe_default([3]f32{ 3, 4, 0 }, array_fallback);
+    try std.testing.expectEqual([3]f32, @TypeOf(normalized_array));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), normalized_array[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), normalized_array[1], 0.0001);
 }
 
 test dot {

@@ -217,6 +217,27 @@ pub fn inverse(q: anytype) @TypeOf(q) {
     return conjugate(q) / @as(@TypeOf(q), @splat(vector.norm(q)));
 }
 
+/// Returns `q` scaled to unit length, or `identity` when `q` is too short to denote a
+/// rotation. `vector.normalize` divides by the norm unconditionally, so a zero quaternion
+/// yields NaN; a rotation wants a usable value instead.
+///
+/// The threshold is on the *squared* norm, so no square root is taken on the reject path.
+pub fn normalize(q: anytype, min_norm_sqr: std.meta.Child(@TypeOf(q))) @TypeOf(q) {
+    comptime {
+        std.debug.assert(@typeInfo(@TypeOf(q)) == .vector);
+        std.debug.assert(@typeInfo(@TypeOf(q)).vector.len == 4);
+    }
+    const T = std.meta.Child(@TypeOf(q));
+    const len_sqr = vector.norm_sqr(q);
+    if (len_sqr <= min_norm_sqr) return identity(T);
+    return q / @as(@TypeOf(q), @splat(@sqrt(len_sqr)));
+}
+
+/// `normalize` with a default threshold of 1.0e-6 on the squared norm.
+pub fn normalize_default(q: anytype) @TypeOf(q) {
+    return normalize(q, 1.0e-6);
+}
+
 pub fn slerp(a: anytype, b: anytype, factor: std.meta.Child(@TypeOf(a))) Quat(std.meta.Child(@TypeOf(a))) {
     comptime {
         std.debug.assert(@typeInfo(@TypeOf(a)) == .vector);
@@ -269,6 +290,31 @@ pub fn lerp(a: anytype, b: anytype, factor: std.meta.Child(@TypeOf(a))) Quat(std
         @as(Quat(std.meta.Child(@TypeOf(a))), @splat(factor)) * map_to_vector(b);
 }
 
+/// Normalized lerp: interpolates along the chord and renormalizes, taking the shorter of the
+/// two arcs. Cheaper than `slerp` but not constant angular velocity.
+///
+/// Unlike `lerp`, this negates `b` when the two quaternions lie on opposite hemispheres, so
+/// `nlerp(q, -q, t)` stays at `q` rather than sweeping through the antipodal rotation. Since
+/// `q` and `-q` denote the same orientation, that flip is what makes the result track the
+/// intended rotation.
+pub fn nlerp(a: anytype, b: anytype, factor: std.meta.Child(@TypeOf(a))) Quat(std.meta.Child(@TypeOf(a))) {
+    comptime {
+        std.debug.assert(@typeInfo(@TypeOf(a)) == .vector);
+        std.debug.assert(@typeInfo(@TypeOf(a)).vector.len == 4);
+        std.debug.assert(@typeInfo(@TypeOf(b)) == .vector);
+        std.debug.assert(@typeInfo(@TypeOf(b)).vector.len == 4);
+        std.debug.assert(@TypeOf(a) == @TypeOf(b));
+    }
+    const inner_a = map_to_vector(a);
+    const inner_b = map_to_vector(b);
+    const nearest = if (vector.dot(inner_a, inner_b) < 0) -inner_b else inner_b;
+    return normalize_default(lerp(inner_a, nearest, factor));
+}
+
+/// Intrinsic Z-Y-X (equivalently extrinsic X-Y-Z): `q = qz * qy * qx`, i.e. the X rotation is
+/// applied first about the fixed axes. `angles` is ordered `.{ x, y, z }` regardless.
+///
+/// See `from_euler_xyz_intrinsic` for the mirrored convention.
 pub fn from_eular_angles(inAngles: anytype) @Vector(4, std.meta.Child(@TypeOf(inAngles))) {
     comptime {
         std.debug.assert(@typeInfo(@TypeOf(inAngles)) == .vector);
@@ -298,6 +344,8 @@ pub fn from_rotation(axis: anytype, angle: std.meta.Child(@TypeOf(axis))) @Vecto
     return .{ in_axis[0] * std.math.sin(angle * 0.5), in_axis[1] * std.math.sin(angle * 0.5), in_axis[2] * std.math.sin(angle * 0.5), std.math.cos(angle * 0.5) };
 }
 
+/// Inverse of `from_eular_angles`: recovers intrinsic Z-Y-X angles as `.{ x, y, z }`.
+/// `q` is assumed normalized.
 pub fn to_eular_angles(q: anytype) @Vector(3, std.meta.Child(@TypeOf(q))) {
     comptime {
         std.debug.assert(@typeInfo(@TypeOf(q)) == .vector);
@@ -322,6 +370,61 @@ pub fn to_eular_angles(q: anytype) @Vector(3, std.meta.Child(@TypeOf(q))) {
     const yaw = std.math.atan2(t3, t4);
 
     return .{ roll, pitch, yaw };
+}
+
+/// Intrinsic X-Y-Z (equivalently extrinsic Z-Y-X): `q = qx * qy * qz`, i.e. the Z rotation is
+/// applied first about the fixed axes. `angles` is ordered `.{ x, y, z }`.
+///
+/// This is the mirror of `from_eular_angles`, which composes in the opposite order. The two
+/// are not interchangeable; pick by the convention your data was authored in.
+pub fn from_euler_xyz_intrinsic(angles: anytype) @Vector(4, std.meta.Child(@TypeOf(angles))) {
+    comptime {
+        std.debug.assert(@typeInfo(@TypeOf(angles)) == .vector);
+        std.debug.assert(@typeInfo(@TypeOf(angles)).vector.len == 3);
+    }
+
+    const half = @as(@TypeOf(angles), @splat(0.5)) * angles;
+    const res = vector.sin_cos(half);
+
+    const sx = res.sin_out[0];
+    const cx = res.cos_out[0];
+    const sy = res.sin_out[1];
+    const cy = res.cos_out[1];
+    const sz = res.sin_out[2];
+    const cz = res.cos_out[2];
+
+    return .{
+        sx * cy * cz + cx * sy * sz,
+        cx * sy * cz - sx * cy * sz,
+        cx * cy * sz + sx * sy * cz,
+        cx * cy * cz - sx * sy * sz,
+    };
+}
+
+/// Inverse of `from_euler_xyz_intrinsic`: recovers intrinsic X-Y-Z angles as `.{ x, y, z }`.
+/// `q` is assumed normalized.
+///
+/// The Y angle is extracted through `asin` and so is clamped to [-pi/2, pi/2]; at the poles
+/// (|sin y| == 1) the X and Z angles are not separable and the decomposition is not unique.
+pub fn to_euler_xyz_intrinsic(q: anytype) @Vector(3, std.meta.Child(@TypeOf(q))) {
+    comptime {
+        std.debug.assert(@typeInfo(@TypeOf(q)) == .vector);
+        std.debug.assert(@typeInfo(@TypeOf(q)).vector.len == 4);
+    }
+    const T = std.meta.Child(@TypeOf(q));
+
+    // Matrix elements of the rotation q denotes: r12, r22, r02, r01, r00.
+    const sin_x = 2.0 * (q[3] * q[0] - q[1] * q[2]);
+    const cos_x = 1.0 - 2.0 * (q[0] * q[0] + q[1] * q[1]);
+    const sin_y = std.math.clamp(2.0 * (q[3] * q[1] + q[2] * q[0]), @as(T, -1.0), @as(T, 1.0));
+    const sin_z = 2.0 * (q[3] * q[2] - q[0] * q[1]);
+    const cos_z = 1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2]);
+
+    return .{
+        std.math.atan2(sin_x, cos_x),
+        std.math.asin(sin_y),
+        std.math.atan2(sin_z, cos_z),
+    };
 }
 
 test from_to {
@@ -349,11 +452,122 @@ test lerp {
     try std.testing.expect(vector.is_close_default(lerp(v1, v2, 0.25), Quat4f32{ 2, 3, 4, 5 }));
 }
 
-//test to_eular_angles {
-//    var qx: Quat4f32 = from_eular_angles(from_rotation(x_axis(f32), std.math.degreesToRadians(-10)));
-//    var qy: Quat4f32 = from_eular_angles(from_rotation(y_axis(f32), std.math.degreesToRadians(-20)));
-//    var qz: Quat4f32 = from_eular_angles(from_rotation(z_axis(f32), std.math.degreesToRadians(-30)));
-//}
+test normalize {
+    // A degenerate quaternion falls back to identity rather than dividing through to NaN.
+    try std.testing.expectEqual(identity(f32), normalize_default(Quat4f32{ 0, 0, 0, 0 }));
+    try std.testing.expect(std.math.isNan(vector.normalize(Quat4f32{ 0, 0, 0, 0 })[0]));
+
+    // An already-unit quaternion is left alone.
+    const unit = from_rotation(x_axis(f32), 0.7);
+    try std.testing.expect(vector.is_close(normalize_default(unit), unit, 1e-12));
+
+    // A scaled one is brought back to unit length.
+    const scaled = @as(Quat4f32, @splat(3.0)) * unit;
+    try std.testing.expect(vector.is_close(normalize_default(scaled), unit, 1e-12));
+    try std.testing.expect(vector.is_normalized_default(normalize_default(Quat4f32{ 1, 2, 3, 4 })));
+
+    // The threshold is on the squared norm.
+    const tiny = @as(Quat4f32, @splat(1.0e-4)) * unit; // norm_sqr == 1.0e-8
+    try std.testing.expectEqual(identity(f32), normalize_default(tiny));
+    try std.testing.expect(vector.is_close(normalize(tiny, 1.0e-12), unit, 1e-6));
+}
+
+test nlerp {
+    const a = from_rotation(x_axis(f32), 0.3);
+    const b = from_rotation(x_axis(f32), 1.1);
+
+    // Endpoints are reproduced, and every sample stays on the unit sphere.
+    try std.testing.expect(vector.is_close(nlerp(a, b, 0), a, 1e-6));
+    try std.testing.expect(vector.is_close(nlerp(a, b, 1), b, 1e-6));
+    for ([_]f32{ 0, 0.25, 0.5, 0.75, 1 }) |t| {
+        try std.testing.expect(vector.is_normalized_default(nlerp(a, b, t)));
+    }
+
+    // Along a single axis nlerp stays on the arc, so it agrees with slerp.
+    try std.testing.expect(vector.is_close(nlerp(a, b, 0.5), slerp(a, b, 0.5), 1e-6));
+
+    // The hemisphere flip: q and -q denote the same orientation, so interpolating between
+    // them must stay put. Plain `lerp` collapses to zero at the midpoint instead.
+    try std.testing.expect(vector.is_close(nlerp(a, -a, 0.5), a, 1e-6));
+    try std.testing.expect(vector.is_close_default(lerp(a, -a, 0.5), @as(Quat4f32, @splat(0))));
+}
+
+test from_eular_angles {
+    // Pins the convention: intrinsic Z-Y-X, i.e. qz * qy * qx.
+    const angles = @Vector(3, f32){ 0.3, -0.7, 1.1 };
+    const composed = mul(
+        from_rotation(z_axis(f32), angles[2]),
+        mul(from_rotation(y_axis(f32), angles[1]), from_rotation(x_axis(f32), angles[0])),
+    );
+    try std.testing.expect(vector.is_close(from_eular_angles(angles), composed, 1e-6));
+
+    // Single-axis inputs reduce to the corresponding axis rotation.
+    try std.testing.expect(vector.is_close(
+        from_eular_angles(@Vector(3, f32){ 0.4, 0, 0 }),
+        from_rotation(x_axis(f32), 0.4),
+        1e-6,
+    ));
+    try std.testing.expect(vector.is_close(
+        from_eular_angles(@Vector(3, f32){ 0, 0, -0.9 }),
+        from_rotation(z_axis(f32), -0.9),
+        1e-6,
+    ));
+}
+
+test to_eular_angles {
+    // Round trips away from the gimbal-lock poles.
+    const angles = @Vector(3, f32){ 0.3, -0.7, 1.1 };
+    try std.testing.expect(vector.is_close(to_eular_angles(from_eular_angles(angles)), angles, 1e-6));
+}
+
+test from_euler_xyz_intrinsic {
+    // Pins the mirrored convention: intrinsic X-Y-Z, i.e. qx * qy * qz.
+    const angles = @Vector(3, f32){ 0.3, -0.7, 1.1 };
+    const composed = mul(
+        from_rotation(x_axis(f32), angles[0]),
+        mul(from_rotation(y_axis(f32), angles[1]), from_rotation(z_axis(f32), angles[2])),
+    );
+    try std.testing.expect(vector.is_close(from_euler_xyz_intrinsic(angles), composed, 1e-6));
+
+    // The result is unit length without an explicit normalize.
+    try std.testing.expect(vector.is_normalized_default(from_euler_xyz_intrinsic(angles)));
+
+    // Single-axis inputs agree with `from_eular_angles`; multi-axis ones must not.
+    try std.testing.expect(vector.is_close(
+        from_euler_xyz_intrinsic(@Vector(3, f32){ 0, 0.4, 0 }),
+        from_eular_angles(@Vector(3, f32){ 0, 0.4, 0 }),
+        1e-6,
+    ));
+    try std.testing.expect(!vector.is_close(
+        from_euler_xyz_intrinsic(angles),
+        from_eular_angles(angles),
+        1e-6,
+    ));
+}
+
+test to_euler_xyz_intrinsic {
+    // Round trips away from the gimbal-lock poles.
+    const angles = @Vector(3, f32){ 0.3, -0.7, 1.1 };
+    try std.testing.expect(vector.is_close(
+        to_euler_xyz_intrinsic(from_euler_xyz_intrinsic(angles)),
+        angles,
+        1e-6,
+    ));
+
+    // Recovering from a composed rotation gives back the generating angles.
+    for ([_]@Vector(3, f32){
+        .{ 0, 0, 0 },
+        .{ 0.5, 0, 0 },
+        .{ 0, 0, -1.2 },
+        .{ -0.9, 1.0, 0.2 },
+    }) |e| {
+        try std.testing.expect(vector.is_close(
+            to_euler_xyz_intrinsic(from_euler_xyz_intrinsic(e)),
+            e,
+            1e-6,
+        ));
+    }
+}
 
 test rotate_vector {
     const q = from_rotation(z_axis(f32), std.math.pi / 2.0);
