@@ -1,16 +1,18 @@
 pub const vec = @import("vector.zig");
-pub const Mat = @import("matrix.zig").Mat;
+pub const matrix = @import("matrix.zig");
+pub const Mat = matrix.Mat;
+pub const Quat = @import("quaternion.zig").Quat;
 
-pub fn toRadians(degrees: anytype) @TypeOf(degrees) {
-    return degrees * (std.math.pi / 180);
+pub fn toRadians(T: type, degrees: T) T {
+    return degrees * (std.math.pi / 180.0);
 }
 
-pub fn toDegrees(radians: anytype) @TypeOf(radians) {
-    return radians * (1 / (std.math.pi / 180));
+pub fn toDegrees(T: type, radians: T) T {
+    return radians * (1 / (std.math.pi / 180.0));
 }
 
 test {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }
 
 const std = @import("std");
